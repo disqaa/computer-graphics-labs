@@ -25,6 +25,12 @@ endif()
 set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD_REQUIRED TRUE CXX_STANDARD 20)
 
 FetchContent_Declare(
+	glm
+	GIT_REPOSITORY https://github.com/g-truc/glm.git
+	GIT_TAG 1.0.1
+)
+
+FetchContent_Declare(
 	glfw
 	GIT_REPOSITORY https://github.com/glfw/glfw.git
 	GIT_TAG 3.5.1
@@ -56,6 +62,7 @@ set(GLFW_BUILD_TESTS OFF)
 set(GLFW_BUILD_DOCS OFF)
 
 FetchContent_MakeAvailable(
+	glm
 	glfw
 	vk-bootstrap
 	VulkanMemoryAllocator
@@ -63,6 +70,7 @@ FetchContent_MakeAvailable(
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
+	glm::glm
 	glfw
 	Vulkan::Vulkan
 	vk-bootstrap::vk-bootstrap
@@ -103,8 +111,8 @@ if(GLSLC_FOUND)
 	# To compile shader file, use compile_shader function with a file name
 	# of a shader inside shaders directory. See example below:
 
-	# compile_shader(example.vert)
-	# compile_shader(example.frag)
+	compile_shader(triangle.vert)
+	compile_shader(triangle.frag)
 
 	add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
 	add_dependencies(${PROJECT_NAME} shaders)
