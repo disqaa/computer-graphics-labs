@@ -1,5 +1,6 @@
 #include "application.hpp"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -18,14 +19,12 @@ namespace application {
 
 	namespace {
 
-		// Данные, которые уходят в вершинный шейдер через push constants
 		struct PushConstants {
 			glm::mat4 mvp;
 			glm::vec4 tint;
 		};
 		static_assert(sizeof(PushConstants) <= 128, "Push constants are too large");
 
-		// Объекты Vulkan
 		VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
 		VkPipeline pipeline = VK_NULL_HANDLE;
 
@@ -35,10 +34,9 @@ namespace application {
 		VmaAllocation index_allocation = VK_NULL_HANDLE;
 		uint32_t index_count = 0;
 
-		// Состояние интерфейса
-		int projection_type = 0; // 0 - перспективная, 1 - ортографическая
+		int projection_type = 0;
 		float fov_degrees = 60.0f;
-		float ortho_size = 2.0f; // половина высоты видимой области
+		float ortho_size = 2.0f;
 		float near_plane = 0.1f;
 		float far_plane = 100.0f;
 
@@ -46,6 +44,14 @@ namespace application {
 		glm::vec3 rotation_degrees{ 20.0f, 30.0f, 0.0f };
 		glm::vec3 scale{ 1.0f, 1.0f, 1.0f };
 		glm::vec3 tint{ 1.0f, 1.0f, 1.0f };
+
+		bool animation_playing = true;
+		float animation_speed = 1.0f;
+		float animation_time = 0.0f;
+		float trajectory_radius = 2.0f;
+		float trajectory_height = 0.8f;
+		float trajectory_depth = 1.0f;
+		float spin_speed = 60.0f;
 
 		bool createBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage,
 			VkBuffer& buffer, VmaAllocation& allocation) {
@@ -167,7 +173,6 @@ namespace application {
 				.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
 			};
 
-			// Viewport и scissor задаются динамически в render()
 			const VkPipelineViewportStateCreateInfo viewport = {
 				.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
 				.viewportCount = 1,
@@ -267,19 +272,23 @@ namespace application {
 			return ok;
 		}
 
-		// Матрица проекция * вид * модель
 		glm::mat4 buildMVP(VkExtent2D extent) {
 			const float aspect = float(extent.width) / float(extent.height);
 
-			// Модель: масштаб, затем повороты, затем перенос
+			const float t = animation_time;
+			const glm::vec3 offset(trajectory_radius * std::sin(t),
+				trajectory_height * std::sin(2.0f * t),
+				trajectory_depth * std::sin(3.0f * t));
+			const glm::vec3 angles = rotation_degrees +
+				glm::vec3(0.5f * spin_speed * t, spin_speed * t, 0.0f);
+
 			glm::mat4 model(1.0f);
-			model = glm::translate(model, position);
-			model = glm::rotate(model, glm::radians(rotation_degrees.z), glm::vec3(0.0f, 0.0f, 1.0f));
-			model = glm::rotate(model, glm::radians(rotation_degrees.y), glm::vec3(0.0f, 1.0f, 0.0f));
-			model = glm::rotate(model, glm::radians(rotation_degrees.x), glm::vec3(1.0f, 0.0f, 0.0f));
+			model = glm::translate(model, position + offset);
+			model = glm::rotate(model, glm::radians(angles.z), glm::vec3(0.0f, 0.0f, 1.0f));
+			model = glm::rotate(model, glm::radians(angles.y), glm::vec3(0.0f, 1.0f, 0.0f));
+			model = glm::rotate(model, glm::radians(angles.x), glm::vec3(1.0f, 0.0f, 0.0f));
 			model = glm::scale(model, scale);
 
-			// Вид: камера в точке (0, 0, 5), смотрит в начало координат
 			const glm::mat4 view = glm::lookAt(glm::vec3(0.0f, 0.0f, 5.0f),
 				glm::vec3(0.0f, 0.0f, 0.0f),
 				glm::vec3(0.0f, 1.0f, 0.0f));
@@ -295,13 +304,12 @@ namespace application {
 					near_plane, far_plane);
 			}
 
-			// В Vulkan ось Y в clip space направлена вниз, в отличие от OpenGL (и GLM)
 			projection[1][1] *= -1.0f;
 
 			return projection * view * model;
 		}
 
-	} // namespace
+	}
 
 	bool initialize() {
 		const geometry::Mesh mesh = geometry::make_truncated_tetrahedron();
@@ -334,6 +342,10 @@ namespace application {
 	}
 
 	void update([[maybe_unused]] double time) {
+		if (animation_playing) {
+			animation_time += ImGui::GetIO().DeltaTime * animation_speed;
+		}
+
 		ImGui::Begin("Truncated tetrahedron");
 
 		ImGui::SeparatorText("Projection");
@@ -358,6 +370,20 @@ namespace application {
 		ImGui::SeparatorText("Color");
 		ImGui::ColorEdit3("Tint", &tint.x);
 
+		ImGui::SeparatorText("Animation");
+		if (ImGui::Button(animation_playing ? "Pause" : "Play")) {
+			animation_playing = !animation_playing;
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Restart")) {
+			animation_time = 0.0f;
+		}
+		ImGui::SliderFloat("Speed", &animation_speed, 0.0f, 5.0f);
+		ImGui::SliderFloat("Radius (X)", &trajectory_radius, 0.0f, 4.0f);
+		ImGui::SliderFloat("Height (Y)", &trajectory_height, 0.0f, 3.0f);
+		ImGui::SliderFloat("Depth (Z)", &trajectory_depth, 0.0f, 3.0f);
+		ImGui::SliderFloat("Spin (deg/s)", &spin_speed, 0.0f, 360.0f);
+
 		if (ImGui::Button("Reset")) {
 			projection_type = 0;
 			fov_degrees = 60.0f;
@@ -368,6 +394,13 @@ namespace application {
 			rotation_degrees = { 20.0f, 30.0f, 0.0f };
 			scale = { 1.0f, 1.0f, 1.0f };
 			tint = { 1.0f, 1.0f, 1.0f };
+			animation_playing = true;
+			animation_speed = 1.0f;
+			animation_time = 0.0f;
+			trajectory_radius = 2.0f;
+			trajectory_height = 0.8f;
+			trajectory_depth = 1.0f;
+			spin_speed = 60.0f;
 		}
 
 		ImGui::End();
@@ -383,7 +416,6 @@ namespace application {
 
 		vkBeginCommandBuffer(fd.command_buffer, &begin_info);
 
-		// Два вложения в render pass: цвет и глубина
 		VkClearValue clear_values[2] = {};
 		clear_values[0].color = { {0.1f, 0.1f, 0.1f, 1.0f} };
 		clear_values[1].depthStencil = { 1.0f, 0 };
@@ -431,4 +463,4 @@ namespace application {
 		vkEndCommandBuffer(fd.command_buffer);
 	}
 
-} // namespace application
+}
