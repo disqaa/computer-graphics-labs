@@ -1,6 +1,5 @@
 #include "application.hpp"
 
-#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -19,42 +18,75 @@ namespace application {
 
 	namespace {
 
-		struct PushConstants {
-			glm::mat4 mvp;
-			glm::vec4 tint;
+		struct SceneUniforms {
+			glm::mat4 view_projection;
+			glm::vec4 camera_position;
+			glm::vec4 directional_light_direction;
+			glm::vec4 directional_light_color;
+			glm::vec4 ambient_light;
+			uint32_t point_light_count;
+			uint32_t spot_light_count;
+			uint32_t padding[2];
 		};
-		static_assert(sizeof(PushConstants) <= 128, "Push constants are too large");
+		static_assert(sizeof(SceneUniforms) == 144, "SceneUniforms must match std140 layout");
 
+		struct ModelUniform {
+			glm::mat4 model;
+			glm::vec4 albedo;
+			glm::vec4 specular;
+			float alpha;
+			float padding[3];
+		};
+		static_assert(sizeof(ModelUniform) == 112, "ModelUniform must match std140 layout");
+
+		struct Buffer {
+			VkBuffer handle = VK_NULL_HANDLE;
+			VmaAllocation allocation = VK_NULL_HANDLE;
+		};
+
+		struct Object {
+			Buffer uniform_buffer;
+			VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+		};
+
+		VkDescriptorSetLayout scene_set_layout = VK_NULL_HANDLE;
+		VkDescriptorSetLayout model_set_layout = VK_NULL_HANDLE;
+		VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
 		VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
 		VkPipeline pipeline = VK_NULL_HANDLE;
 
-		VkBuffer vertex_buffer = VK_NULL_HANDLE;
-		VmaAllocation vertex_allocation = VK_NULL_HANDLE;
-		VkBuffer index_buffer = VK_NULL_HANDLE;
-		VmaAllocation index_allocation = VK_NULL_HANDLE;
+		Buffer vertex_buffer;
+		Buffer index_buffer;
 		uint32_t index_count = 0;
 
-		int projection_type = 0;
+		Buffer scene_buffer;
+		VkDescriptorSet scene_descriptor_set = VK_NULL_HANDLE;
+
+		Object figure;
+
+		glm::vec3 camera_position{ 0.0f, 0.0f, 5.0f };
+		float camera_yaw = 0.0f;
+		float camera_pitch = 0.0f;
 		float fov_degrees = 60.0f;
-		float ortho_size = 2.0f;
 		float near_plane = 0.1f;
 		float far_plane = 100.0f;
+
+		glm::vec3 directional_direction{ -0.5f, -1.0f, -0.3f };
+		glm::vec3 directional_color{ 1.0f, 1.0f, 1.0f };
+		float directional_intensity = 1.0f;
+
+		glm::vec3 ambient_color{ 1.0f, 1.0f, 1.0f };
+		float ambient_intensity = 0.1f;
 
 		glm::vec3 position{ 0.0f, 0.0f, 0.0f };
 		glm::vec3 rotation_degrees{ 20.0f, 30.0f, 0.0f };
 		glm::vec3 scale{ 1.0f, 1.0f, 1.0f };
-		glm::vec3 tint{ 1.0f, 1.0f, 1.0f };
 
-		bool animation_playing = true;
-		float animation_speed = 1.0f;
-		float animation_time = 0.0f;
-		float trajectory_radius = 2.0f;
-		float trajectory_height = 0.8f;
-		float trajectory_depth = 1.0f;
-		float spin_speed = 60.0f;
+		glm::vec3 albedo{ 0.8f, 0.8f, 0.8f };
+		glm::vec3 specular{ 1.0f, 1.0f, 1.0f };
+		float alpha = 32.0f;
 
-		bool createBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage,
-			VkBuffer& buffer, VmaAllocation& allocation) {
+		bool createBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage, Buffer& buffer) {
 			auto& context = graphics::internal::context;
 
 			const VkBufferCreateInfo buffer_info = {
@@ -70,17 +102,32 @@ namespace application {
 			};
 
 			if (vmaCreateBuffer(context.allocator, &buffer_info, &allocation_info,
-				&buffer, &allocation, nullptr) != VK_SUCCESS) {
+				&buffer.handle, &buffer.allocation, nullptr) != VK_SUCCESS) {
 				std::cerr << "Failed to create Vulkan buffer\n";
 				return false;
 			}
 
-			if (vmaCopyMemoryToAllocation(context.allocator, data, allocation, 0, size) != VK_SUCCESS) {
-				std::cerr << "Failed to upload data to Vulkan buffer\n";
-				return false;
+			if (data != nullptr) {
+				if (vmaCopyMemoryToAllocation(context.allocator, data, buffer.allocation, 0, size) != VK_SUCCESS) {
+					std::cerr << "Failed to upload data to Vulkan buffer\n";
+					return false;
+				}
 			}
 
 			return true;
+		}
+
+		void uploadBuffer(const Buffer& buffer, const void* data, VkDeviceSize size) {
+			auto& context = graphics::internal::context;
+			vmaCopyMemoryToAllocation(context.allocator, data, buffer.allocation, 0, size);
+		}
+
+		void destroyBuffer(Buffer& buffer) {
+			auto& context = graphics::internal::context;
+			if (buffer.handle != VK_NULL_HANDLE) {
+				vmaDestroyBuffer(context.allocator, buffer.handle, buffer.allocation);
+			}
+			buffer = {};
 		}
 
 		VkShaderModule loadShader(const char* path) {
@@ -113,11 +160,118 @@ namespace application {
 			return module;
 		}
 
+		void writeUniformBufferDescriptor(VkDescriptorSet set, uint32_t binding,
+			const Buffer& buffer, VkDeviceSize range) {
+			auto& context = graphics::internal::context;
+
+			const VkDescriptorBufferInfo buffer_info = {
+				.buffer = buffer.handle,
+				.offset = 0,
+				.range = range,
+			};
+
+			const VkWriteDescriptorSet write = {
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstSet = set,
+				.dstBinding = binding,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+				.pBufferInfo = &buffer_info,
+			};
+
+			vkUpdateDescriptorSets(context.device, 1, &write, 0, nullptr);
+		}
+
+		bool createDescriptorSetLayout(VkDescriptorSetLayout& layout) {
+			auto& context = graphics::internal::context;
+
+			const VkDescriptorSetLayoutBinding binding = {
+				.binding = 0,
+				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+				.descriptorCount = 1,
+				.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+			};
+
+			const VkDescriptorSetLayoutCreateInfo layout_info = {
+				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+				.bindingCount = 1,
+				.pBindings = &binding,
+			};
+
+			if (vkCreateDescriptorSetLayout(context.device, &layout_info, nullptr, &layout) != VK_SUCCESS) {
+				std::cerr << "Failed to create Vulkan descriptor set layout\n";
+				return false;
+			}
+
+			return true;
+		}
+
+		bool createDescriptors() {
+			auto& context = graphics::internal::context;
+
+			if (!createDescriptorSetLayout(scene_set_layout)) return false;
+			if (!createDescriptorSetLayout(model_set_layout)) return false;
+
+			const VkDescriptorPoolSize pool_sizes[] = {
+				{.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 8 },
+			};
+
+			const VkDescriptorPoolCreateInfo pool_info = {
+				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+				.maxSets = 8,
+				.poolSizeCount = sizeof(pool_sizes) / sizeof(pool_sizes[0]),
+				.pPoolSizes = pool_sizes,
+			};
+
+			if (vkCreateDescriptorPool(context.device, &pool_info, nullptr, &descriptor_pool) != VK_SUCCESS) {
+				std::cerr << "Failed to create Vulkan descriptor pool\n";
+				return false;
+			}
+
+			if (!createBuffer(nullptr, sizeof(SceneUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, scene_buffer)) {
+				return false;
+			}
+
+			if (!createBuffer(nullptr, sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+				figure.uniform_buffer)) {
+				return false;
+			}
+
+			const VkDescriptorSetAllocateInfo scene_set_info = {
+				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+				.descriptorPool = descriptor_pool,
+				.descriptorSetCount = 1,
+				.pSetLayouts = &scene_set_layout,
+			};
+
+			if (vkAllocateDescriptorSets(context.device, &scene_set_info, &scene_descriptor_set) != VK_SUCCESS) {
+				std::cerr << "Failed to allocate Vulkan descriptor set for the scene\n";
+				return false;
+			}
+
+			const VkDescriptorSetAllocateInfo model_set_info = {
+				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+				.descriptorPool = descriptor_pool,
+				.descriptorSetCount = 1,
+				.pSetLayouts = &model_set_layout,
+			};
+
+			if (vkAllocateDescriptorSets(context.device, &model_set_info, &figure.descriptor_set) != VK_SUCCESS) {
+				std::cerr << "Failed to allocate Vulkan descriptor set for the model\n";
+				return false;
+			}
+
+			writeUniformBufferDescriptor(scene_descriptor_set, 0, scene_buffer, sizeof(SceneUniforms));
+			writeUniformBufferDescriptor(figure.descriptor_set, 0, figure.uniform_buffer, sizeof(ModelUniform));
+
+			return true;
+		}
+
 		bool createPipeline() {
 			auto& context = graphics::internal::context;
 
-			VkShaderModule vert = loadShader("shaders/triangle.vert.spv");
-			VkShaderModule frag = loadShader("shaders/triangle.frag.spv");
+			VkShaderModule vert = loadShader("shaders/scene.vert.spv");
+			VkShaderModule frag = loadShader("shaders/scene.frag.spv");
 			if (vert == VK_NULL_HANDLE || frag == VK_NULL_HANDLE) {
 				if (vert != VK_NULL_HANDLE) vkDestroyShaderModule(context.device, vert, nullptr);
 				if (frag != VK_NULL_HANDLE) vkDestroyShaderModule(context.device, frag, nullptr);
@@ -156,7 +310,7 @@ namespace application {
 					.location = 1,
 					.binding = 0,
 					.format = VK_FORMAT_R32G32B32_SFLOAT,
-					.offset = uint32_t(offsetof(geometry::Vertex, color)),
+					.offset = uint32_t(offsetof(geometry::Vertex, normal)),
 				},
 			};
 
@@ -222,16 +376,12 @@ namespace application {
 				.pDynamicStates = dynamic_states,
 			};
 
-			const VkPushConstantRange push_range = {
-				.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
-				.offset = 0,
-				.size = sizeof(PushConstants),
-			};
+			const VkDescriptorSetLayout set_layouts[] = { scene_set_layout, model_set_layout };
 
 			const VkPipelineLayoutCreateInfo layout_info = {
 				.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-				.pushConstantRangeCount = 1,
-				.pPushConstantRanges = &push_range,
+				.setLayoutCount = sizeof(set_layouts) / sizeof(set_layouts[0]),
+				.pSetLayouts = set_layouts,
 			};
 
 			bool ok = true;
@@ -272,44 +422,31 @@ namespace application {
 			return ok;
 		}
 
-		glm::mat4 buildMVP(VkExtent2D extent) {
+		glm::mat4 buildViewProjection(VkExtent2D extent) {
 			const float aspect = float(extent.width) / float(extent.height);
 
-			const float t = animation_time;
-			const glm::vec3 offset(trajectory_radius * std::sin(t),
-				trajectory_height * std::sin(2.0f * t),
-				trajectory_depth * std::sin(3.0f * t));
-			const glm::vec3 angles = rotation_degrees +
-				glm::vec3(0.5f * spin_speed * t, spin_speed * t, 0.0f);
+			glm::mat4 view(1.0f);
+			view = glm::rotate(view, glm::radians(-camera_pitch), glm::vec3(1.0f, 0.0f, 0.0f));
+			view = glm::rotate(view, glm::radians(-camera_yaw), glm::vec3(0.0f, 1.0f, 0.0f));
+			view = glm::translate(view, -camera_position);
 
-			glm::mat4 model(1.0f);
-			model = glm::translate(model, position + offset);
-			model = glm::rotate(model, glm::radians(angles.z), glm::vec3(0.0f, 0.0f, 1.0f));
-			model = glm::rotate(model, glm::radians(angles.y), glm::vec3(0.0f, 1.0f, 0.0f));
-			model = glm::rotate(model, glm::radians(angles.x), glm::vec3(1.0f, 0.0f, 0.0f));
-			model = glm::scale(model, scale);
-
-			const glm::mat4 view = glm::lookAt(glm::vec3(0.0f, 0.0f, 5.0f),
-				glm::vec3(0.0f, 0.0f, 0.0f),
-				glm::vec3(0.0f, 1.0f, 0.0f));
-
-			glm::mat4 projection;
-			if (projection_type == 0) {
-				projection = glm::perspective(glm::radians(fov_degrees), aspect, near_plane, far_plane);
-			}
-			else {
-				const float half_height = ortho_size;
-				const float half_width = ortho_size * aspect;
-				projection = glm::ortho(-half_width, half_width, -half_height, half_height,
-					near_plane, far_plane);
-			}
-
+			glm::mat4 projection = glm::perspective(glm::radians(fov_degrees), aspect, near_plane, far_plane);
 			projection[1][1] *= -1.0f;
 
-			return projection * view * model;
+			return projection * view;
 		}
 
-	}
+		glm::mat4 buildModelMatrix() {
+			glm::mat4 model(1.0f);
+			model = glm::translate(model, position);
+			model = glm::rotate(model, glm::radians(rotation_degrees.z), glm::vec3(0.0f, 0.0f, 1.0f));
+			model = glm::rotate(model, glm::radians(rotation_degrees.y), glm::vec3(0.0f, 1.0f, 0.0f));
+			model = glm::rotate(model, glm::radians(rotation_degrees.x), glm::vec3(1.0f, 0.0f, 0.0f));
+			model = glm::scale(model, scale);
+			return model;
+		}
+
+	} // namespace
 
 	bool initialize() {
 		const geometry::Mesh mesh = geometry::make_truncated_tetrahedron();
@@ -317,13 +454,17 @@ namespace application {
 
 		if (!createBuffer(mesh.vertices.data(),
 			mesh.vertices.size() * sizeof(geometry::Vertex),
-			VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_buffer, vertex_allocation)) {
+			VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_buffer)) {
 			return false;
 		}
 
 		if (!createBuffer(mesh.indices.data(),
 			mesh.indices.size() * sizeof(uint16_t),
-			VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_buffer, index_allocation)) {
+			VK_BUFFER_USAGE_INDEX_BUFFER_BIT, index_buffer)) {
+			return false;
+		}
+
+		if (!createDescriptors()) {
 			return false;
 		}
 
@@ -337,70 +478,50 @@ namespace application {
 		vkDestroyPipeline(context.device, pipeline, nullptr);
 		vkDestroyPipelineLayout(context.device, pipeline_layout, nullptr);
 
-		vmaDestroyBuffer(context.allocator, index_buffer, index_allocation);
-		vmaDestroyBuffer(context.allocator, vertex_buffer, vertex_allocation);
+		vkDestroyDescriptorPool(context.device, descriptor_pool, nullptr);
+		vkDestroyDescriptorSetLayout(context.device, model_set_layout, nullptr);
+		vkDestroyDescriptorSetLayout(context.device, scene_set_layout, nullptr);
+
+		destroyBuffer(figure.uniform_buffer);
+		destroyBuffer(scene_buffer);
+		destroyBuffer(index_buffer);
+		destroyBuffer(vertex_buffer);
 	}
 
 	void update([[maybe_unused]] double time) {
-		if (animation_playing) {
-			animation_time += ImGui::GetIO().DeltaTime * animation_speed;
-		}
+		ImGui::SetNextWindowSize(ImVec2(380.0f, 0.0f), ImGuiCond_FirstUseEver);
+		ImGui::Begin("Lab 2: camera and lighting");
 
-		ImGui::Begin("Truncated tetrahedron");
-
-		ImGui::SeparatorText("Projection");
-		ImGui::RadioButton("Perspective", &projection_type, 0);
-		ImGui::SameLine();
-		ImGui::RadioButton("Orthographic", &projection_type, 1);
-
-		if (projection_type == 0) {
+		if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+			ImGui::DragFloat3("Camera position", &camera_position.x, 0.05f, -50.0f, 50.0f);
+			ImGui::SliderFloat("Yaw (deg)", &camera_yaw, -180.0f, 180.0f);
+			ImGui::SliderFloat("Pitch (deg)", &camera_pitch, -89.0f, 89.0f);
 			ImGui::SliderFloat("FOV (deg)", &fov_degrees, 10.0f, 120.0f);
+			ImGui::SliderFloat("Near", &near_plane, 0.01f, 5.0f);
+			ImGui::SliderFloat("Far", &far_plane, 6.0f, 200.0f);
 		}
-		else {
-			ImGui::SliderFloat("Ortho size", &ortho_size, 0.5f, 10.0f);
+
+		if (ImGui::CollapsingHeader("Directional light", ImGuiTreeNodeFlags_DefaultOpen)) {
+			ImGui::DragFloat3("Light direction", &directional_direction.x, 0.01f, -1.0f, 1.0f);
+			ImGui::ColorEdit3("Light color", &directional_color.x);
+			ImGui::SliderFloat("Light intensity", &directional_intensity, 0.0f, 5.0f);
 		}
-		ImGui::SliderFloat("Near", &near_plane, 0.01f, 5.0f);
-		ImGui::SliderFloat("Far", &far_plane, 6.0f, 200.0f);
 
-		ImGui::SeparatorText("Transform");
-		ImGui::DragFloat3("Position", &position.x, 0.02f, -5.0f, 5.0f);
-		ImGui::SliderFloat3("Rotation (deg)", &rotation_degrees.x, -180.0f, 180.0f);
-		ImGui::DragFloat3("Scale", &scale.x, 0.01f, 0.1f, 5.0f);
-
-		ImGui::SeparatorText("Color");
-		ImGui::ColorEdit3("Tint", &tint.x);
-
-		ImGui::SeparatorText("Animation");
-		if (ImGui::Button(animation_playing ? "Pause" : "Play")) {
-			animation_playing = !animation_playing;
+		if (ImGui::CollapsingHeader("Ambient light", ImGuiTreeNodeFlags_DefaultOpen)) {
+			ImGui::ColorEdit3("Ambient color", &ambient_color.x);
+			ImGui::SliderFloat("Ambient intensity", &ambient_intensity, 0.0f, 1.0f);
 		}
-		ImGui::SameLine();
-		if (ImGui::Button("Restart")) {
-			animation_time = 0.0f;
-		}
-		ImGui::SliderFloat("Speed", &animation_speed, 0.0f, 5.0f);
-		ImGui::SliderFloat("Radius (X)", &trajectory_radius, 0.0f, 4.0f);
-		ImGui::SliderFloat("Height (Y)", &trajectory_height, 0.0f, 3.0f);
-		ImGui::SliderFloat("Depth (Z)", &trajectory_depth, 0.0f, 3.0f);
-		ImGui::SliderFloat("Spin (deg/s)", &spin_speed, 0.0f, 360.0f);
 
-		if (ImGui::Button("Reset")) {
-			projection_type = 0;
-			fov_degrees = 60.0f;
-			ortho_size = 2.0f;
-			near_plane = 0.1f;
-			far_plane = 100.0f;
-			position = { 0.0f, 0.0f, 0.0f };
-			rotation_degrees = { 20.0f, 30.0f, 0.0f };
-			scale = { 1.0f, 1.0f, 1.0f };
-			tint = { 1.0f, 1.0f, 1.0f };
-			animation_playing = true;
-			animation_speed = 1.0f;
-			animation_time = 0.0f;
-			trajectory_radius = 2.0f;
-			trajectory_height = 0.8f;
-			trajectory_depth = 1.0f;
-			spin_speed = 60.0f;
+		if (ImGui::CollapsingHeader("Material", ImGuiTreeNodeFlags_DefaultOpen)) {
+			ImGui::ColorEdit3("Albedo", &albedo.x);
+			ImGui::ColorEdit3("Specular color", &specular.x);
+			ImGui::SliderFloat("Alpha (shininess)", &alpha, 1.0f, 256.0f);
+		}
+
+		if (ImGui::CollapsingHeader("Object transform", ImGuiTreeNodeFlags_DefaultOpen)) {
+			ImGui::DragFloat3("Position", &position.x, 0.02f, -5.0f, 5.0f);
+			ImGui::SliderFloat3("Rotation (deg)", &rotation_degrees.x, -180.0f, 180.0f);
+			ImGui::DragFloat3("Scale", &scale.x, 0.01f, 0.1f, 5.0f);
 		}
 
 		ImGui::End();
@@ -408,6 +529,33 @@ namespace application {
 
 	void render(const graphics::internal::FrameData& fd) {
 		auto& context = graphics::internal::context;
+
+		glm::vec3 light_direction = directional_direction;
+		if (glm::length(light_direction) < 1e-4f) {
+			light_direction = glm::vec3(0.0f, -1.0f, 0.0f);
+		}
+		light_direction = glm::normalize(light_direction);
+
+		const SceneUniforms scene = {
+			.view_projection = buildViewProjection(context.swapchain_extent),
+			.camera_position = glm::vec4(camera_position, 1.0f),
+			.directional_light_direction = glm::vec4(light_direction, 0.0f),
+			.directional_light_color = glm::vec4(directional_color * directional_intensity, 1.0f),
+			.ambient_light = glm::vec4(ambient_color * ambient_intensity, 1.0f),
+			.point_light_count = 0,
+			.spot_light_count = 0,
+			.padding = {0, 0},
+		};
+		uploadBuffer(scene_buffer, &scene, sizeof(scene));
+
+		const ModelUniform model = {
+			.model = buildModelMatrix(),
+			.albedo = glm::vec4(albedo, 1.0f),
+			.specular = glm::vec4(specular, 1.0f),
+			.alpha = alpha,
+			.padding = {0.0f, 0.0f, 0.0f},
+		};
+		uploadBuffer(figure.uniform_buffer, &model, sizeof(model));
 
 		const VkCommandBufferBeginInfo begin_info = {
 			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -446,16 +594,14 @@ namespace application {
 		const VkRect2D scissor = { .offset = {0, 0}, .extent = context.swapchain_extent };
 		vkCmdSetScissor(fd.command_buffer, 0, 1, &scissor);
 
-		const PushConstants push = {
-			.mvp = buildMVP(context.swapchain_extent),
-			.tint = glm::vec4(tint, 1.0f),
-		};
-		vkCmdPushConstants(fd.command_buffer, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-			0, sizeof(push), &push);
+		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+			0, 1, &scene_descriptor_set, 0, nullptr);
+		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+			1, 1, &figure.descriptor_set, 0, nullptr);
 
 		const VkDeviceSize offset = 0;
-		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vertex_buffer, &offset);
-		vkCmdBindIndexBuffer(fd.command_buffer, index_buffer, 0, VK_INDEX_TYPE_UINT16);
+		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vertex_buffer.handle, &offset);
+		vkCmdBindIndexBuffer(fd.command_buffer, index_buffer.handle, 0, VK_INDEX_TYPE_UINT16);
 
 		vkCmdDrawIndexed(fd.command_buffer, index_count, 1, 0, 0, 0);
 
@@ -463,4 +609,4 @@ namespace application {
 		vkEndCommandBuffer(fd.command_buffer);
 	}
 
-}
+} // namespace application

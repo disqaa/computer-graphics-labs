@@ -10,7 +10,7 @@ namespace geometry {
 
 	struct Vertex {
 		float position[3];
-		float color[3];
+		float normal[3];
 	};
 
 	struct Mesh {
@@ -43,18 +43,12 @@ namespace geometry {
 			for (int sx = -1; sx <= 1; sx += 2)
 				for (int sy = -1; sy <= 1; sy += 2)
 					for (int sz = -1; sz <= 1; sz += 2) {
-						if (sx * sy * sz != 1) continue; 
+						if (sx * sy * sz != 1) continue;
 						p.push_back({ sx * b[0] / 3.0f, sy * b[1] / 3.0f, sz * b[2] / 3.0f });
 					}
 		}
 
 		Mesh mesh;
-		for (const auto& v : p) {
-			mesh.vertices.push_back({
-				{v[0], v[1], v[2]},
-				{v[0] * 0.5f + 0.5f, v[1] * 0.5f + 0.5f, v[2] * 0.5f + 0.5f}
-				});
-		}
 
 		const V3 dirs[4] = { {1, 1, 1}, {1, -1, -1}, {-1, 1, -1}, {-1, -1, 1} };
 		for (int s = 1; s >= -1; s -= 2) {
@@ -80,10 +74,21 @@ namespace geometry {
 						std::atan2(dot(pb, w), dot(pb, u));
 					});
 
+				const V3 face_normal = normalize(cross(sub(p[face[1]], p[face[0]]),
+					sub(p[face[2]], p[face[0]])));
+
+				const uint16_t first = uint16_t(mesh.vertices.size());
+				for (int i : face) {
+					mesh.vertices.push_back({
+						{p[i][0], p[i][1], p[i][2]},
+						{face_normal[0], face_normal[1], face_normal[2]}
+						});
+				}
+
 				for (size_t i = 1; i + 1 < face.size(); ++i) {
-					mesh.indices.push_back((uint16_t)face[0]);
-					mesh.indices.push_back((uint16_t)face[i]);
-					mesh.indices.push_back((uint16_t)face[i + 1]);
+					mesh.indices.push_back(first);
+					mesh.indices.push_back(uint16_t(first + i));
+					mesh.indices.push_back(uint16_t(first + i + 1));
 				}
 			}
 		}

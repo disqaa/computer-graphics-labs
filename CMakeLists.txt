@@ -111,8 +111,8 @@ if(GLSLC_FOUND)
 	# To compile shader file, use compile_shader function with a file name
 	# of a shader inside shaders directory. See example below:
 
-	compile_shader(triangle.vert)
-	compile_shader(triangle.frag)
+	compile_shader(scene.vert)
+	compile_shader(scene.frag)
 
 	add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
 	add_dependencies(${PROJECT_NAME} shaders)
