@@ -1,9 +1,12 @@
 #include "application.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <string>
 #include <vector>
 
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
@@ -39,6 +42,35 @@ namespace application {
 		};
 		static_assert(sizeof(ModelUniform) == 112, "ModelUniform must match std140 layout");
 
+		struct PointLightData {
+			glm::vec4 position;
+			glm::vec4 color;
+		};
+		static_assert(sizeof(PointLightData) == 32, "PointLightData must match std430 layout");
+
+		struct SpotLightData {
+			glm::vec4 position;
+			glm::vec4 color;
+			glm::vec4 direction;
+			glm::vec4 angles;
+		};
+		static_assert(sizeof(SpotLightData) == 64, "SpotLightData must match std430 layout");
+
+		struct PointLight {
+			glm::vec3 position;
+			glm::vec3 color;
+			float intensity;
+		};
+
+		struct SpotLight {
+			glm::vec3 position;
+			glm::vec3 direction;
+			glm::vec3 color;
+			float intensity;
+			float inner_angle;
+			float outer_angle;
+		};
+
 		struct Buffer {
 			VkBuffer handle = VK_NULL_HANDLE;
 			VmaAllocation allocation = VK_NULL_HANDLE;
@@ -47,6 +79,11 @@ namespace application {
 		struct Object {
 			Buffer uniform_buffer;
 			VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+		};
+
+		struct LightBuffer {
+			Buffer buffer;
+			size_t capacity = 0;
 		};
 
 		VkDescriptorSetLayout scene_set_layout = VK_NULL_HANDLE;
@@ -63,6 +100,18 @@ namespace application {
 		VkDescriptorSet scene_descriptor_set = VK_NULL_HANDLE;
 
 		Object figure;
+
+		LightBuffer point_light_buffer;
+		LightBuffer spot_light_buffer;
+
+		std::vector<PointLight> point_lights = {
+			{ glm::vec3(2.0f, 1.5f, 2.0f), glm::vec3(1.0f, 0.8f, 0.5f), 10.0f },
+		};
+
+		std::vector<SpotLight> spot_lights = {
+			{ glm::vec3(-2.0f, 3.0f, 2.0f), glm::vec3(2.0f, -3.0f, -2.0f), glm::vec3(0.5f, 0.7f, 1.0f),
+			  30.0f, 15.0f, 25.0f },
+		};
 
 		glm::vec3 camera_position{ 0.0f, 0.0f, 5.0f };
 		float camera_yaw = 0.0f;
@@ -160,7 +209,7 @@ namespace application {
 			return module;
 		}
 
-		void writeUniformBufferDescriptor(VkDescriptorSet set, uint32_t binding,
+		void writeBufferDescriptor(VkDescriptorSet set, uint32_t binding, VkDescriptorType type,
 			const Buffer& buffer, VkDeviceSize range) {
 			auto& context = graphics::internal::context;
 
@@ -175,27 +224,21 @@ namespace application {
 				.dstSet = set,
 				.dstBinding = binding,
 				.descriptorCount = 1,
-				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+				.descriptorType = type,
 				.pBufferInfo = &buffer_info,
 			};
 
 			vkUpdateDescriptorSets(context.device, 1, &write, 0, nullptr);
 		}
 
-		bool createDescriptorSetLayout(VkDescriptorSetLayout& layout) {
+		bool createDescriptorSetLayout(const VkDescriptorSetLayoutBinding* bindings, uint32_t binding_count,
+			VkDescriptorSetLayout& layout) {
 			auto& context = graphics::internal::context;
-
-			const VkDescriptorSetLayoutBinding binding = {
-				.binding = 0,
-				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.descriptorCount = 1,
-				.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-			};
 
 			const VkDescriptorSetLayoutCreateInfo layout_info = {
 				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-				.bindingCount = 1,
-				.pBindings = &binding,
+				.bindingCount = binding_count,
+				.pBindings = bindings,
 			};
 
 			if (vkCreateDescriptorSetLayout(context.device, &layout_info, nullptr, &layout) != VK_SUCCESS) {
@@ -206,14 +249,75 @@ namespace application {
 			return true;
 		}
 
+		bool ensureLightBuffer(LightBuffer& light_buffer, uint32_t binding, size_t element_size, size_t required) {
+			if (light_buffer.buffer.handle != VK_NULL_HANDLE && required <= light_buffer.capacity) {
+				return true;
+			}
+
+			const size_t new_capacity = std::max<size_t>({ required, light_buffer.capacity * 2, 4 });
+			const VkDeviceSize new_size = VkDeviceSize(new_capacity * element_size);
+
+			Buffer new_buffer;
+			if (!createBuffer(nullptr, new_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, new_buffer)) {
+				return false;
+			}
+
+			destroyBuffer(light_buffer.buffer);
+			light_buffer.buffer = new_buffer;
+			light_buffer.capacity = new_capacity;
+
+			writeBufferDescriptor(scene_descriptor_set, binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+				light_buffer.buffer, new_size);
+
+			return true;
+		}
+
 		bool createDescriptors() {
 			auto& context = graphics::internal::context;
 
-			if (!createDescriptorSetLayout(scene_set_layout)) return false;
-			if (!createDescriptorSetLayout(model_set_layout)) return false;
+			const VkDescriptorSetLayoutBinding scene_bindings[] = {
+				{
+					.binding = 0,
+					.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+					.descriptorCount = 1,
+					.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+				},
+				{
+					.binding = 1,
+					.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+					.descriptorCount = 1,
+					.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+				},
+				{
+					.binding = 2,
+					.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+					.descriptorCount = 1,
+					.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+				},
+			};
+
+			const VkDescriptorSetLayoutBinding model_bindings[] = {
+				{
+					.binding = 0,
+					.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+					.descriptorCount = 1,
+					.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+				},
+			};
+
+			if (!createDescriptorSetLayout(scene_bindings, sizeof(scene_bindings) / sizeof(scene_bindings[0]),
+				scene_set_layout)) {
+				return false;
+			}
+
+			if (!createDescriptorSetLayout(model_bindings, sizeof(model_bindings) / sizeof(model_bindings[0]),
+				model_set_layout)) {
+				return false;
+			}
 
 			const VkDescriptorPoolSize pool_sizes[] = {
 				{.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 8 },
+				{.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4 },
 			};
 
 			const VkDescriptorPoolCreateInfo pool_info = {
@@ -261,8 +365,13 @@ namespace application {
 				return false;
 			}
 
-			writeUniformBufferDescriptor(scene_descriptor_set, 0, scene_buffer, sizeof(SceneUniforms));
-			writeUniformBufferDescriptor(figure.descriptor_set, 0, figure.uniform_buffer, sizeof(ModelUniform));
+			writeBufferDescriptor(scene_descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+				scene_buffer, sizeof(SceneUniforms));
+			writeBufferDescriptor(figure.descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+				figure.uniform_buffer, sizeof(ModelUniform));
+
+			if (!ensureLightBuffer(point_light_buffer, 1, sizeof(PointLightData), 1)) return false;
+			if (!ensureLightBuffer(spot_light_buffer, 2, sizeof(SpotLightData), 1)) return false;
 
 			return true;
 		}
@@ -482,6 +591,8 @@ namespace application {
 		vkDestroyDescriptorSetLayout(context.device, model_set_layout, nullptr);
 		vkDestroyDescriptorSetLayout(context.device, scene_set_layout, nullptr);
 
+		destroyBuffer(spot_light_buffer.buffer);
+		destroyBuffer(point_light_buffer.buffer);
 		destroyBuffer(figure.uniform_buffer);
 		destroyBuffer(scene_buffer);
 		destroyBuffer(index_buffer);
@@ -512,6 +623,63 @@ namespace application {
 			ImGui::SliderFloat("Ambient intensity", &ambient_intensity, 0.0f, 1.0f);
 		}
 
+		if (ImGui::CollapsingHeader("Point lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+			if (ImGui::Button("Add point light")) {
+				point_lights.push_back({ glm::vec3(0.0f, 2.0f, 2.0f), glm::vec3(1.0f, 1.0f, 1.0f), 10.0f });
+			}
+
+			int remove_index = -1;
+			for (size_t i = 0; i < point_lights.size(); ++i) {
+				PointLight& light = point_lights[i];
+				ImGui::PushID(int(i));
+				const std::string label = "Point light " + std::to_string(i + 1);
+				if (ImGui::TreeNode(label.c_str())) {
+					ImGui::DragFloat3("Position", &light.position.x, 0.05f, -20.0f, 20.0f);
+					ImGui::ColorEdit3("Color", &light.color.x);
+					ImGui::SliderFloat("Intensity", &light.intensity, 0.0f, 100.0f);
+					if (ImGui::Button("Remove")) {
+						remove_index = int(i);
+					}
+					ImGui::TreePop();
+				}
+				ImGui::PopID();
+			}
+			if (remove_index >= 0) {
+				point_lights.erase(point_lights.begin() + remove_index);
+			}
+		}
+
+		if (ImGui::CollapsingHeader("Spot lights", ImGuiTreeNodeFlags_DefaultOpen)) {
+			if (ImGui::Button("Add spot light")) {
+				spot_lights.push_back({ glm::vec3(0.0f, 4.0f, 0.0f), glm::vec3(0.0f, -1.0f, 0.0f),
+										glm::vec3(1.0f, 1.0f, 1.0f), 30.0f, 15.0f, 25.0f });
+			}
+
+			int remove_index = -1;
+			for (size_t i = 0; i < spot_lights.size(); ++i) {
+				SpotLight& light = spot_lights[i];
+				ImGui::PushID(int(i));
+				const std::string label = "Spot light " + std::to_string(i + 1);
+				if (ImGui::TreeNode(label.c_str())) {
+					ImGui::DragFloat3("Position", &light.position.x, 0.05f, -20.0f, 20.0f);
+					ImGui::DragFloat3("Direction", &light.direction.x, 0.01f, -1.0f, 1.0f);
+					ImGui::ColorEdit3("Color", &light.color.x);
+					ImGui::SliderFloat("Intensity", &light.intensity, 0.0f, 200.0f);
+					ImGui::SliderFloat("Outer angle (deg)", &light.outer_angle, 1.0f, 89.0f);
+					light.inner_angle = std::min(light.inner_angle, light.outer_angle);
+					ImGui::SliderFloat("Inner angle (deg)", &light.inner_angle, 0.0f, light.outer_angle);
+					if (ImGui::Button("Remove")) {
+						remove_index = int(i);
+					}
+					ImGui::TreePop();
+				}
+				ImGui::PopID();
+			}
+			if (remove_index >= 0) {
+				spot_lights.erase(spot_lights.begin() + remove_index);
+			}
+		}
+
 		if (ImGui::CollapsingHeader("Material", ImGuiTreeNodeFlags_DefaultOpen)) {
 			ImGui::ColorEdit3("Albedo", &albedo.x);
 			ImGui::ColorEdit3("Specular color", &specular.x);
@@ -536,14 +704,47 @@ namespace application {
 		}
 		light_direction = glm::normalize(light_direction);
 
+		std::vector<PointLightData> point_data;
+		for (const PointLight& light : point_lights) {
+			point_data.push_back({ glm::vec4(light.position, 1.0f),
+								   glm::vec4(light.color * light.intensity, 1.0f) });
+		}
+
+		std::vector<SpotLightData> spot_data;
+		for (const SpotLight& light : spot_lights) {
+			glm::vec3 direction = light.direction;
+			if (glm::length(direction) < 1e-4f) {
+				direction = glm::vec3(0.0f, -1.0f, 0.0f);
+			}
+			direction = glm::normalize(direction);
+
+			const float inner = glm::radians(std::min(light.inner_angle, light.outer_angle));
+			const float outer = glm::radians(light.outer_angle);
+
+			spot_data.push_back({ glm::vec4(light.position, 1.0f),
+								  glm::vec4(light.color * light.intensity, 1.0f),
+								  glm::vec4(direction, 0.0f),
+								  glm::vec4(std::cos(inner), std::cos(outer), 0.0f, 0.0f) });
+		}
+
+		ensureLightBuffer(point_light_buffer, 1, sizeof(PointLightData), point_data.size());
+		ensureLightBuffer(spot_light_buffer, 2, sizeof(SpotLightData), spot_data.size());
+
+		if (!point_data.empty()) {
+			uploadBuffer(point_light_buffer.buffer, point_data.data(), point_data.size() * sizeof(PointLightData));
+		}
+		if (!spot_data.empty()) {
+			uploadBuffer(spot_light_buffer.buffer, spot_data.data(), spot_data.size() * sizeof(SpotLightData));
+		}
+
 		const SceneUniforms scene = {
 			.view_projection = buildViewProjection(context.swapchain_extent),
 			.camera_position = glm::vec4(camera_position, 1.0f),
 			.directional_light_direction = glm::vec4(light_direction, 0.0f),
 			.directional_light_color = glm::vec4(directional_color * directional_intensity, 1.0f),
 			.ambient_light = glm::vec4(ambient_color * ambient_intensity, 1.0f),
-			.point_light_count = 0,
-			.spot_light_count = 0,
+			.point_light_count = uint32_t(point_data.size()),
+			.spot_light_count = uint32_t(spot_data.size()),
 			.padding = {0, 0},
 		};
 		uploadBuffer(scene_buffer, &scene, sizeof(scene));
