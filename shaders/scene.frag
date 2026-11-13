@@ -2,6 +2,7 @@
 
 layout(location = 0) in vec3 in_world_position;
 layout(location = 1) in vec3 in_world_normal;
+layout(location = 2) in vec3 in_color;
 
 layout(location = 0) out vec4 out_color;
 
@@ -39,10 +40,11 @@ layout(std140, set = 1, binding = 0) uniform ModelUniform {
 	mat4 model;
 	vec4 albedo;
 	vec4 specular;
+	vec4 tint;
 	float alpha;
 } model_uniforms;
 
-vec3 blinnPhong(vec3 normal, vec3 view_direction, vec3 light_direction, vec3 radiance) {
+vec3 blinnPhong(vec3 normal, vec3 view_direction, vec3 light_direction, vec3 radiance, vec3 base_color) {
 	float n_dot_l = max(dot(normal, light_direction), 0.0);
 
 	vec3 half_vector = normalize(light_direction + view_direction);
@@ -53,7 +55,7 @@ vec3 blinnPhong(vec3 normal, vec3 view_direction, vec3 light_direction, vec3 rad
 		specular_factor = pow(n_dot_h, model_uniforms.alpha);
 	}
 
-	vec3 diffuse = model_uniforms.albedo.rgb * n_dot_l;
+	vec3 diffuse = base_color * n_dot_l;
 	vec3 specular = model_uniforms.specular.rgb * specular_factor;
 
 	return radiance * (diffuse + specular);
@@ -63,11 +65,13 @@ void main() {
 	vec3 normal = normalize(in_world_normal);
 	vec3 view_direction = normalize(scene_uniforms.camera_position.xyz - in_world_position);
 
-	vec3 color = scene_uniforms.ambient_light.rgb * model_uniforms.albedo.rgb;
+	vec3 base_color = in_color * model_uniforms.tint.rgb * model_uniforms.albedo.rgb;
+
+	vec3 color = scene_uniforms.ambient_light.rgb * base_color;
 
 	vec3 to_directional_light = normalize(-scene_uniforms.directional_light_direction.xyz);
 	color += blinnPhong(normal, view_direction, to_directional_light,
-	                    scene_uniforms.directional_light_color.rgb);
+	                    scene_uniforms.directional_light_color.rgb, base_color);
 
 	for (uint i = 0u; i < scene_uniforms.point_light_count; ++i) {
 		PointLight light = point_lights[i];
@@ -79,7 +83,7 @@ void main() {
 		float attenuation = 1.0 / distance_squared;
 
 		color += blinnPhong(normal, view_direction, light_direction,
-		                    light.color.rgb * attenuation);
+		                    light.color.rgb * attenuation, base_color);
 	}
 
 	for (uint i = 0u; i < scene_uniforms.spot_light_count; ++i) {
@@ -103,7 +107,7 @@ void main() {
 		float attenuation = 1.0 / distance_squared;
 
 		color += blinnPhong(normal, view_direction, light_direction,
-		                    light.color.rgb * attenuation * spot_factor);
+		                    light.color.rgb * attenuation * spot_factor, base_color);
 	}
 
 	out_color = vec4(color, 1.0);

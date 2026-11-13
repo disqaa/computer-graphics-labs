@@ -11,6 +11,7 @@ namespace geometry {
 	struct Vertex {
 		float position[3];
 		float normal[3];
+		float color[3];
 	};
 
 	struct Mesh {
@@ -81,7 +82,8 @@ namespace geometry {
 				for (int i : face) {
 					mesh.vertices.push_back({
 						{p[i][0], p[i][1], p[i][2]},
-						{face_normal[0], face_normal[1], face_normal[2]}
+						{face_normal[0], face_normal[1], face_normal[2]},
+						{p[i][0] * 0.5f + 0.5f, p[i][1] * 0.5f + 0.5f, p[i][2] * 0.5f + 0.5f}
 						});
 				}
 
