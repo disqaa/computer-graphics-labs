@@ -12,6 +12,7 @@ namespace geometry {
 		float position[3];
 		float normal[3];
 		float color[3];
+		float uv[2];
 	};
 
 	struct Mesh {
@@ -78,12 +79,21 @@ namespace geometry {
 				const V3 face_normal = normalize(cross(sub(p[face[1]], p[face[0]]),
 					sub(p[face[2]], p[face[0]])));
 
+				const V3 edge_vector = sub(p[face[1]], p[face[0]]);
+				const float edge_length = std::sqrt(dot(edge_vector, edge_vector));
+				const float uv_scale = 0.5f / edge_length;
+
 				const uint16_t first = uint16_t(mesh.vertices.size());
 				for (int i : face) {
+					const V3 offset_from_center = sub(p[i], c);
+					const float x = dot(offset_from_center, u);
+					const float y = dot(offset_from_center, w);
+
 					mesh.vertices.push_back({
 						{p[i][0], p[i][1], p[i][2]},
 						{face_normal[0], face_normal[1], face_normal[2]},
-						{p[i][0] * 0.5f + 0.5f, p[i][1] * 0.5f + 0.5f, p[i][2] * 0.5f + 0.5f}
+						{p[i][0] * 0.5f + 0.5f, p[i][1] * 0.5f + 0.5f, p[i][2] * 0.5f + 0.5f},
+						{0.5f + x * uv_scale, 0.5f - y * uv_scale}
 						});
 				}
 

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -83,11 +84,28 @@ namespace application {
 			uint32_t index_count = 0;
 		};
 
-		struct Object {
-			const GpuMesh* mesh = nullptr;
-			Buffer uniform_buffer;
-			VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+		struct SceneObject {
+			glm::vec3 position{ 0.0f, 0.0f, 0.0f };
+			glm::vec3 rotation_degrees{ 20.0f, 30.0f, 0.0f };
+			glm::vec3 scale{ 1.0f, 1.0f, 1.0f };
+			glm::vec3 albedo{ 1.0f, 1.0f, 1.0f };
+			glm::vec3 specular{ 1.0f, 1.0f, 1.0f };
+			glm::vec3 tint{ 1.0f, 1.0f, 1.0f };
+			float alpha = 32.0f;
+			bool animated = false;
 		};
+
+		struct StagingContext {
+			VkCommandPool command_pool = VK_NULL_HANDLE;
+			VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+			Buffer buffer;
+			uint8_t* mapped = nullptr;
+			VkDeviceSize offset = 0;
+			VkDeviceSize capacity = 0;
+		};
+
+		constexpr uint32_t max_objects = 64;
+		constexpr VkDeviceSize staging_buffer_size = 64ull * 1024ull * 1024ull;
 
 		struct LightBuffer {
 			Buffer buffer;
@@ -105,7 +123,14 @@ namespace application {
 		Buffer scene_buffer;
 		VkDescriptorSet scene_descriptor_set = VK_NULL_HANDLE;
 
-		Object figure;
+		Buffer model_buffer;
+		VkDeviceSize model_uniform_stride = 0;
+		VkDescriptorSet model_descriptor_set = VK_NULL_HANDLE;
+
+		StagingContext staging;
+
+		std::vector<SceneObject> objects;
+		int selected_object = 0;
 
 		LightBuffer point_light_buffer;
 		LightBuffer spot_light_buffer;
@@ -135,22 +160,14 @@ namespace application {
 		glm::vec3 ambient_color{ 1.0f, 1.0f, 1.0f };
 		float ambient_intensity = 0.1f;
 
-		glm::vec3 position{ 0.0f, 0.0f, 0.0f };
-		glm::vec3 rotation_degrees{ 20.0f, 30.0f, 0.0f };
-		glm::vec3 scale{ 1.0f, 1.0f, 1.0f };
-
 		bool animation_playing = true;
 		float animation_speed = 1.0f;
 		float animation_time = 0.0f;
-		float trajectory_radius = 2.0f;
-		float trajectory_height = 0.8f;
+		float trajectory_radius = 1.2f;
+		float trajectory_height = 0.6f;
 		float trajectory_depth = 1.0f;
 		float spin_speed = 60.0f;
 
-		glm::vec3 albedo{ 1.0f, 1.0f, 1.0f };
-		glm::vec3 specular{ 1.0f, 1.0f, 1.0f };
-		float alpha = 32.0f;
-		glm::vec3 tint{ 1.0f, 1.0f, 1.0f };
 
 		bool createBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage, Buffer& buffer) {
 			auto& context = graphics::internal::context;
@@ -183,9 +200,9 @@ namespace application {
 			return true;
 		}
 
-		void uploadBuffer(const Buffer& buffer, const void* data, VkDeviceSize size) {
+		void uploadBuffer(const Buffer& buffer, const void* data, VkDeviceSize size, VkDeviceSize offset = 0) {
 			auto& context = graphics::internal::context;
-			vmaCopyMemoryToAllocation(context.allocator, data, buffer.allocation, 0, size);
+			vmaCopyMemoryToAllocation(context.allocator, data, buffer.allocation, offset, size);
 		}
 
 		void destroyBuffer(Buffer& buffer) {
@@ -194,6 +211,180 @@ namespace application {
 				vmaDestroyBuffer(context.allocator, buffer.handle, buffer.allocation);
 			}
 			buffer = {};
+		}
+
+		bool beginStaging() {
+			auto& context = graphics::internal::context;
+
+			const VkCommandPoolCreateInfo pool_info = {
+				.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+				.queueFamilyIndex = context.graphics_queue_index,
+			};
+
+			if (vkCreateCommandPool(context.device, &pool_info, nullptr, &staging.command_pool) != VK_SUCCESS) {
+				std::cerr << "Failed to create Vulkan command pool for uploads\n";
+				return false;
+			}
+
+			const VkCommandBufferAllocateInfo allocate_info = {
+				.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+				.commandPool = staging.command_pool,
+				.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+				.commandBufferCount = 1,
+			};
+
+			if (vkAllocateCommandBuffers(context.device, &allocate_info, &staging.command_buffer) != VK_SUCCESS) {
+				std::cerr << "Failed to allocate Vulkan command buffer for uploads\n";
+				return false;
+			}
+
+			const VkBufferCreateInfo buffer_info = {
+				.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+				.size = staging_buffer_size,
+				.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+				.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+			};
+
+			const VmaAllocationCreateInfo allocation_info = {
+				.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+				.usage = VMA_MEMORY_USAGE_AUTO,
+			};
+
+			VmaAllocationInfo allocation_result = {};
+			if (vmaCreateBuffer(context.allocator, &buffer_info, &allocation_info, &staging.buffer.handle,
+				&staging.buffer.allocation, &allocation_result) != VK_SUCCESS) {
+				std::cerr << "Failed to create Vulkan staging buffer\n";
+				return false;
+			}
+
+			staging.mapped = static_cast<uint8_t*>(allocation_result.pMappedData);
+			staging.offset = 0;
+			staging.capacity = staging_buffer_size;
+
+			const VkCommandBufferBeginInfo begin_info = {
+				.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+				.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+			};
+
+			if (vkBeginCommandBuffer(staging.command_buffer, &begin_info) != VK_SUCCESS) {
+				std::cerr << "Failed to begin recording of the upload command buffer\n";
+				return false;
+			}
+
+			return true;
+		}
+
+		bool stageData(const void* data, VkDeviceSize size, VkDeviceSize& offset) {
+			auto& context = graphics::internal::context;
+
+			const VkDeviceSize aligned_offset = (staging.offset + 15) & ~VkDeviceSize(15);
+			if (aligned_offset + size > staging.capacity) {
+				std::cerr << "Staging buffer is too small for the uploaded data\n";
+				return false;
+			}
+
+			std::memcpy(staging.mapped + aligned_offset, data, size_t(size));
+			vmaFlushAllocation(context.allocator, staging.buffer.allocation, aligned_offset, size);
+
+			offset = aligned_offset;
+			staging.offset = aligned_offset + size;
+
+			return true;
+		}
+
+		bool endStaging() {
+			auto& context = graphics::internal::context;
+
+			bool ok = true;
+
+			if (staging.command_buffer != VK_NULL_HANDLE) {
+				const VkMemoryBarrier barrier = {
+					.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+					.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+					.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT |
+									 VK_ACCESS_SHADER_READ_BIT,
+				};
+
+				vkCmdPipelineBarrier(staging.command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+					VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+					VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+					0, 1, &barrier, 0, nullptr, 0, nullptr);
+
+				if (vkEndCommandBuffer(staging.command_buffer) != VK_SUCCESS) {
+					std::cerr << "Failed to end recording of the upload command buffer\n";
+					ok = false;
+				}
+			}
+
+			if (ok) {
+				const VkFenceCreateInfo fence_info = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+				VkFence fence = VK_NULL_HANDLE;
+
+				if (vkCreateFence(context.device, &fence_info, nullptr, &fence) != VK_SUCCESS) {
+					std::cerr << "Failed to create Vulkan fence for uploads\n";
+					ok = false;
+				}
+				else {
+					const VkSubmitInfo submit_info = {
+						.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+						.commandBufferCount = 1,
+						.pCommandBuffers = &staging.command_buffer,
+					};
+
+					if (vkQueueSubmit(context.graphics_queue, 1, &submit_info, fence) != VK_SUCCESS) {
+						std::cerr << "Failed to submit the upload command buffer\n";
+						ok = false;
+					}
+					else {
+						vkWaitForFences(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
+					}
+
+					vkDestroyFence(context.device, fence, nullptr);
+				}
+			}
+
+			if (staging.command_pool != VK_NULL_HANDLE) {
+				vkDestroyCommandPool(context.device, staging.command_pool, nullptr);
+			}
+			destroyBuffer(staging.buffer);
+			staging = {};
+
+			return ok;
+		}
+
+		bool createDeviceBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage, Buffer& buffer) {
+			auto& context = graphics::internal::context;
+
+			const VkBufferCreateInfo buffer_info = {
+				.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+				.size = size,
+				.usage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+				.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+			};
+
+			const VmaAllocationCreateInfo allocation_info = {
+				.usage = VMA_MEMORY_USAGE_AUTO,
+			};
+
+			if (vmaCreateBuffer(context.allocator, &buffer_info, &allocation_info,
+				&buffer.handle, &buffer.allocation, nullptr) != VK_SUCCESS) {
+				std::cerr << "Failed to create Vulkan buffer in video memory\n";
+				return false;
+			}
+
+			VkDeviceSize staging_offset = 0;
+			if (!stageData(data, size, staging_offset)) {
+				return false;
+			}
+
+			const VkBufferCopy copy_region = {
+				.srcOffset = staging_offset,
+				.dstOffset = 0,
+				.size = size,
+			};
+			vkCmdCopyBuffer(staging.command_buffer, staging.buffer.handle, buffer.handle, 1, &copy_region);
+
+			return true;
 		}
 
 		VkShaderModule loadShader(const char* path) {
@@ -316,7 +507,7 @@ namespace application {
 			const VkDescriptorSetLayoutBinding model_bindings[] = {
 				{
 					.binding = 0,
-					.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+					.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
 					.descriptorCount = 1,
 					.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 				},
@@ -333,13 +524,14 @@ namespace application {
 			}
 
 			const VkDescriptorPoolSize pool_sizes[] = {
-				{.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 16 },
+				{.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 2 },
+				{.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .descriptorCount = 32 },
 				{.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 4 },
 			};
 
 			const VkDescriptorPoolCreateInfo pool_info = {
 				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-				.maxSets = 16,
+				.maxSets = 32,
 				.poolSizeCount = sizeof(pool_sizes) / sizeof(pool_sizes[0]),
 				.pPoolSizes = pool_sizes,
 			};
@@ -368,6 +560,32 @@ namespace application {
 			writeBufferDescriptor(scene_descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 				scene_buffer, sizeof(SceneUniforms));
 
+			VkPhysicalDeviceProperties physical_device_props = {};
+			vkGetPhysicalDeviceProperties(context.physical_device, &physical_device_props);
+
+			const VkDeviceSize alignment = physical_device_props.limits.minUniformBufferOffsetAlignment;
+			model_uniform_stride = (sizeof(ModelUniform) + alignment - 1) & ~(alignment - 1);
+
+			if (!createBuffer(nullptr, model_uniform_stride * max_objects, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+				model_buffer)) {
+				return false;
+			}
+
+			const VkDescriptorSetAllocateInfo model_set_info = {
+				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+				.descriptorPool = descriptor_pool,
+				.descriptorSetCount = 1,
+				.pSetLayouts = &model_set_layout,
+			};
+
+			if (vkAllocateDescriptorSets(context.device, &model_set_info, &model_descriptor_set) != VK_SUCCESS) {
+				std::cerr << "Failed to allocate Vulkan descriptor set for the models\n";
+				return false;
+			}
+
+			writeBufferDescriptor(model_descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+				model_buffer, sizeof(ModelUniform));
+
 			if (!ensureLightBuffer(point_light_buffer, 1, sizeof(PointLightData), 1)) return false;
 			if (!ensureLightBuffer(spot_light_buffer, 2, sizeof(SpotLightData), 1)) return false;
 
@@ -377,12 +595,12 @@ namespace application {
 		bool createMesh(const geometry::Mesh& mesh, GpuMesh& gpu_mesh) {
 			gpu_mesh.index_count = uint32_t(mesh.indices.size());
 
-			if (!createBuffer(mesh.vertices.data(), mesh.vertices.size() * sizeof(geometry::Vertex),
+			if (!createDeviceBuffer(mesh.vertices.data(), mesh.vertices.size() * sizeof(geometry::Vertex),
 				VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, gpu_mesh.vertex_buffer)) {
 				return false;
 			}
 
-			if (!createBuffer(mesh.indices.data(), mesh.indices.size() * sizeof(uint16_t),
+			if (!createDeviceBuffer(mesh.indices.data(), mesh.indices.size() * sizeof(uint16_t),
 				VK_BUFFER_USAGE_INDEX_BUFFER_BIT, gpu_mesh.index_buffer)) {
 				return false;
 			}
@@ -396,57 +614,16 @@ namespace application {
 			gpu_mesh.index_count = 0;
 		}
 
-		bool createObject(Object& object, const GpuMesh* mesh) {
-			auto& context = graphics::internal::context;
-
-			object.mesh = mesh;
-
-			if (!createBuffer(nullptr, sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-				object.uniform_buffer)) {
-				return false;
-			}
-
-			const VkDescriptorSetAllocateInfo set_info = {
-				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-				.descriptorPool = descriptor_pool,
-				.descriptorSetCount = 1,
-				.pSetLayouts = &model_set_layout,
-			};
-
-			if (vkAllocateDescriptorSets(context.device, &set_info, &object.descriptor_set) != VK_SUCCESS) {
-				std::cerr << "Failed to allocate Vulkan descriptor set for the model\n";
-				return false;
-			}
-
-			writeBufferDescriptor(object.descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				object.uniform_buffer, sizeof(ModelUniform));
-
-			return true;
-		}
-
-		void uploadModelUniform(const Object& object, const glm::mat4& model, const glm::vec3& object_albedo,
-			const glm::vec3& object_tint, const glm::vec3& object_specular,
-			float object_alpha) {
+		void uploadModelUniform(uint32_t index, const glm::mat4& model, const SceneObject& object) {
 			const ModelUniform uniform = {
 				.model = model,
-				.albedo = glm::vec4(object_albedo, 1.0f),
-				.specular = glm::vec4(object_specular, 1.0f),
-				.tint = glm::vec4(object_tint, 1.0f),
-				.alpha = object_alpha,
+				.albedo = glm::vec4(object.albedo, 1.0f),
+				.specular = glm::vec4(object.specular, 1.0f),
+				.tint = glm::vec4(object.tint, 1.0f),
+				.alpha = object.alpha,
 				.padding = {0.0f, 0.0f, 0.0f},
 			};
-			uploadBuffer(object.uniform_buffer, &uniform, sizeof(uniform));
-		}
-
-		void drawObject(VkCommandBuffer command_buffer, const Object& object) {
-			vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
-				1, 1, &object.descriptor_set, 0, nullptr);
-
-			const VkDeviceSize offset = 0;
-			vkCmdBindVertexBuffers(command_buffer, 0, 1, &object.mesh->vertex_buffer.handle, &offset);
-			vkCmdBindIndexBuffer(command_buffer, object.mesh->index_buffer.handle, 0, VK_INDEX_TYPE_UINT16);
-
-			vkCmdDrawIndexed(command_buffer, object.mesh->index_count, 1, 0, 0, 0);
+			uploadBuffer(model_buffer, &uniform, sizeof(uniform), VkDeviceSize(index) * model_uniform_stride);
 		}
 
 		bool createPipeline() {
@@ -499,6 +676,12 @@ namespace application {
 					.binding = 0,
 					.format = VK_FORMAT_R32G32B32_SFLOAT,
 					.offset = uint32_t(offsetof(geometry::Vertex, color)),
+				},
+				{
+					.location = 3,
+					.binding = 0,
+					.format = VK_FORMAT_R32G32_SFLOAT,
+					.offset = uint32_t(offsetof(geometry::Vertex, uv)),
 				},
 			};
 
@@ -633,37 +816,60 @@ namespace application {
 			return projection * view;
 		}
 
-		glm::mat4 buildModelMatrix() {
-			const float t = animation_time;
-			const glm::vec3 offset(trajectory_radius * std::sin(t),
-				trajectory_height * std::sin(2.0f * t),
-				trajectory_depth * std::sin(3.0f * t));
-			const glm::vec3 angles = rotation_degrees +
-				glm::vec3(0.5f * spin_speed * t, spin_speed * t, 0.0f);
+		glm::mat4 buildModelMatrix(const SceneObject& object) {
+			glm::vec3 offset(0.0f);
+			glm::vec3 angles = object.rotation_degrees;
+
+			if (object.animated) {
+				const float t = animation_time;
+				offset = glm::vec3(trajectory_radius * std::sin(t),
+					trajectory_height * std::sin(2.0f * t),
+					trajectory_depth * std::sin(3.0f * t));
+				angles += glm::vec3(0.5f * spin_speed * t, spin_speed * t, 0.0f);
+			}
 
 			glm::mat4 model(1.0f);
-			model = glm::translate(model, position + offset);
+			model = glm::translate(model, object.position + offset);
 			model = glm::rotate(model, glm::radians(angles.z), glm::vec3(0.0f, 0.0f, 1.0f));
 			model = glm::rotate(model, glm::radians(angles.y), glm::vec3(0.0f, 1.0f, 0.0f));
 			model = glm::rotate(model, glm::radians(angles.x), glm::vec3(1.0f, 0.0f, 0.0f));
-			model = glm::scale(model, scale);
+			model = glm::scale(model, object.scale);
 			return model;
 		}
 
 	} // namespace
 
 	bool initialize() {
-		if (!createMesh(geometry::make_truncated_tetrahedron(), figure_mesh)) {
-			return false;
-		}
-
 		if (!createDescriptors()) {
 			return false;
 		}
 
-		if (!createObject(figure, &figure_mesh)) {
+		if (!beginStaging()) {
 			return false;
 		}
+
+		if (!createMesh(geometry::make_truncated_tetrahedron(), figure_mesh)) {
+			endStaging();
+			return false;
+		}
+
+		if (!endStaging()) {
+			return false;
+		}
+
+		SceneObject main_figure;
+		main_figure.animated = true;
+
+		SceneObject left_figure;
+		left_figure.position = glm::vec3(-3.0f, 0.0f, 0.0f);
+		left_figure.rotation_degrees = glm::vec3(-20.0f, 60.0f, 10.0f);
+
+		SceneObject right_figure;
+		right_figure.position = glm::vec3(3.0f, 0.0f, 0.0f);
+		right_figure.rotation_degrees = glm::vec3(30.0f, -40.0f, 0.0f);
+		right_figure.scale = glm::vec3(0.8f, 0.8f, 0.8f);
+
+		objects = { main_figure, left_figure, right_figure };
 
 		return createPipeline();
 	}
@@ -681,7 +887,7 @@ namespace application {
 
 		destroyBuffer(spot_light_buffer.buffer);
 		destroyBuffer(point_light_buffer.buffer);
-		destroyBuffer(figure.uniform_buffer);
+		destroyBuffer(model_buffer);
 		destroyBuffer(scene_buffer);
 		destroyMesh(figure_mesh);
 	}
@@ -692,7 +898,7 @@ namespace application {
 		}
 
 		ImGui::SetNextWindowSize(ImVec2(400.0f, 0.0f), ImGuiCond_FirstUseEver);
-		ImGui::Begin("Lab 2: camera and lighting");
+		ImGui::Begin("Lab 3: textures, camera and lighting");
 
 		if (ImGui::CollapsingHeader("Camera and projection", ImGuiTreeNodeFlags_DefaultOpen)) {
 			ImGui::DragFloat3("Camera position", &camera_position.x, 0.05f, -50.0f, 50.0f);
@@ -781,17 +987,39 @@ namespace application {
 			}
 		}
 
-		if (ImGui::CollapsingHeader("Material", ImGuiTreeNodeFlags_DefaultOpen)) {
-			ImGui::ColorEdit3("Albedo", &albedo.x);
-			ImGui::ColorEdit3("Specular color", &specular.x);
-			ImGui::SliderFloat("Alpha (shininess)", &alpha, 1.0f, 256.0f);
-			ImGui::ColorEdit3("Tint (multiplies vertex colors)", &tint.x);
+		if (ImGui::CollapsingHeader("Objects", ImGuiTreeNodeFlags_DefaultOpen)) {
+			ImGui::Text("Objects in scene: %d", int(objects.size()));
+
+			if (ImGui::Button("Add object") && objects.size() < max_objects) {
+				SceneObject copy = objects[size_t(selected_object)];
+				copy.position += glm::vec3(0.5f, 0.0f, 0.0f);
+				copy.animated = false;
+				objects.push_back(copy);
+				selected_object = int(objects.size()) - 1;
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Remove selected") && objects.size() > 1) {
+				objects.erase(objects.begin() + selected_object);
+			}
+
+			selected_object = std::clamp(selected_object, 0, int(objects.size()) - 1);
+			ImGui::SliderInt("Selected object", &selected_object, 0, int(objects.size()) - 1);
 		}
 
-		if (ImGui::CollapsingHeader("Object transform", ImGuiTreeNodeFlags_DefaultOpen)) {
-			ImGui::DragFloat3("Position", &position.x, 0.02f, -5.0f, 5.0f);
-			ImGui::SliderFloat3("Rotation (deg)", &rotation_degrees.x, -180.0f, 180.0f);
-			ImGui::DragFloat3("Scale", &scale.x, 0.01f, 0.1f, 5.0f);
+		SceneObject& object = objects[size_t(selected_object)];
+
+		if (ImGui::CollapsingHeader("Material (selected object)", ImGuiTreeNodeFlags_DefaultOpen)) {
+			ImGui::ColorEdit3("Albedo", &object.albedo.x);
+			ImGui::ColorEdit3("Specular color", &object.specular.x);
+			ImGui::SliderFloat("Alpha (shininess)", &object.alpha, 1.0f, 256.0f);
+			ImGui::ColorEdit3("Tint (multiplies vertex colors)", &object.tint.x);
+		}
+
+		if (ImGui::CollapsingHeader("Object transform (selected object)", ImGuiTreeNodeFlags_DefaultOpen)) {
+			ImGui::DragFloat3("Position", &object.position.x, 0.02f, -10.0f, 10.0f);
+			ImGui::SliderFloat3("Rotation (deg)", &object.rotation_degrees.x, -180.0f, 180.0f);
+			ImGui::DragFloat3("Scale", &object.scale.x, 0.01f, 0.1f, 5.0f);
+			ImGui::Checkbox("Move along trajectory (animation)", &object.animated);
 		}
 
 		if (ImGui::CollapsingHeader("Animation", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -809,21 +1037,21 @@ namespace application {
 			ImGui::SliderFloat("Spin (deg/s)", &spin_speed, 0.0f, 360.0f);
 		}
 
-		if (ImGui::Button("Reset object, projection and animation")) {
+		if (ImGui::Button("Reset projection, animation and selected object")) {
 			projection_type = 0;
 			fov_degrees = 60.0f;
 			ortho_size = 2.0f;
 			near_plane = 0.1f;
 			far_plane = 100.0f;
-			position = { 0.0f, 0.0f, 0.0f };
-			rotation_degrees = { 20.0f, 30.0f, 0.0f };
-			scale = { 1.0f, 1.0f, 1.0f };
-			tint = { 1.0f, 1.0f, 1.0f };
+			object.position = { 0.0f, 0.0f, 0.0f };
+			object.rotation_degrees = { 20.0f, 30.0f, 0.0f };
+			object.scale = { 1.0f, 1.0f, 1.0f };
+			object.tint = { 1.0f, 1.0f, 1.0f };
 			animation_playing = true;
 			animation_speed = 1.0f;
 			animation_time = 0.0f;
-			trajectory_radius = 2.0f;
-			trajectory_height = 0.8f;
+			trajectory_radius = 1.2f;
+			trajectory_height = 0.6f;
 			trajectory_depth = 1.0f;
 			spin_speed = 60.0f;
 		}
@@ -885,7 +1113,9 @@ namespace application {
 		};
 		uploadBuffer(scene_buffer, &scene, sizeof(scene));
 
-		uploadModelUniform(figure, buildModelMatrix(), albedo, tint, specular, alpha);
+		for (size_t i = 0; i < objects.size(); ++i) {
+			uploadModelUniform(uint32_t(i), buildModelMatrix(objects[i]), objects[i]);
+		}
 
 		const VkCommandBufferBeginInfo begin_info = {
 			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -926,7 +1156,17 @@ namespace application {
 
 		vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
 			0, 1, &scene_descriptor_set, 0, nullptr);
-		drawObject(fd.command_buffer, figure);
+
+		const VkDeviceSize vertex_offset = 0;
+		vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &figure_mesh.vertex_buffer.handle, &vertex_offset);
+		vkCmdBindIndexBuffer(fd.command_buffer, figure_mesh.index_buffer.handle, 0, VK_INDEX_TYPE_UINT16);
+
+		for (size_t i = 0; i < objects.size(); ++i) {
+			const uint32_t dynamic_offset = uint32_t(VkDeviceSize(i) * model_uniform_stride);
+			vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout,
+				1, 1, &model_descriptor_set, 1, &dynamic_offset);
+			vkCmdDrawIndexed(fd.command_buffer, figure_mesh.index_count, 1, 0, 0, 0);
+		}
 
 		vkCmdEndRenderPass(fd.command_buffer);
 		vkEndCommandBuffer(fd.command_buffer);
